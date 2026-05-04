@@ -191,8 +191,8 @@ std::vector<double> conjugate_gradient_marl(
 
     double rs_new = dot(r, r, &stats);
     iters_done = i + 1;
-    final_residual = std::sqrt(rs_new);
     if (rs_new < tol_sq) {
+      final_residual = std::sqrt(rs_new);
       break;
     }
 
@@ -216,6 +216,156 @@ std::vector<double> conjugate_gradient_marl(
       stats.spmv_calls,
       stats.spmv_seconds,
       stats.spmv_calls ? stats.spmv_seconds / stats.spmv_calls : 0.0);
+  return x;
+}
+
+// Fused per-iteration variant: schedules one stripe-task per worker per
+// iteration (instead of one per kernel) and uses marl::Event/WaitGroup to
+// synchronize phases. Same math as conjugate_gradient_marl, fewer fork-joins.
+//
+// Per iteration each stripe-task runs:
+//   A: ap[s..e] = A * p             (writes only own slice of ap)
+//   B: partial_pAp[i] = sum p[j]*ap[j] over [s,e)  (reads only own slice of ap)
+//      <wg_pAp + ev_alpha — main reduces, computes alpha, broadcasts>
+//   C: x[s..e] += alpha*p; r[s..e] -= alpha*ap; partial_rs[i] = sum r[j]^2
+//      <wg_rs + ev_beta — main reduces, decides convergence, computes beta>
+//   D: p[s..e] = r + beta*p   (skipped if converged)
+// No A->B barrier is needed: B reads only ap[s..e), which A just wrote on the
+// same stripe. Cross-stripe reads of p in the next iteration's spmv are
+// covered by wg_iter on the main thread before re-scheduling.
+std::vector<double> conjugate_gradient_marl_fused(
+    const SparseMatrix& A,
+    const std::vector<double>& b,
+    int max_iters,
+    double tol) {
+  const int n = A.num_rows;
+  std::vector<double> x(A.num_cols, 0.0);
+  std::vector<double> r = b;
+  std::vector<double> p = r;
+  std::vector<double> ap(n);
+
+  auto* sch = marl::Scheduler::get();
+  int num_tasks = sch->config().workerThread.count;
+  num_tasks = std::min<int>(num_tasks, n);
+  if (num_tasks <= 0)
+    num_tasks = 1;
+  const int chunk = n / num_tasks;
+
+  const double tol_sq = tol * tol;
+
+  // Initial rs_old = dot(r, r) — single fork-join, before the fused loop.
+  double rs_old = 0.0;
+  {
+    std::vector<PaddedDouble> partials(num_tasks);
+    marl::WaitGroup wg(num_tasks);
+    for (int i = 0; i < num_tasks; ++i) {
+      marl::schedule([&, i] {
+        defer(wg.done());
+        const int s = i * chunk;
+        const int e = (i == num_tasks - 1) ? n : s + chunk;
+        double sum = 0.0;
+        for (int j = s; j < e; ++j)
+          sum += r[j] * r[j];
+        partials[i].v = sum;
+      });
+    }
+    wg.wait();
+    for (const auto& pp : partials)
+      rs_old += pp.v;
+  }
+
+  int iters_done = 0;
+  double final_residual = std::sqrt(rs_old);
+
+  std::vector<PaddedDouble> partial_pAp(num_tasks);
+  std::vector<PaddedDouble> partial_rs(num_tasks);
+
+  // Hoisted out of the loop: each marl::WaitGroup / marl::Event ctor does a
+  // heap allocation (shared_ptr to a Data/Shared block holding mutex + CV).
+  // Reused via add()/clear() each iteration; wg_iter.wait() at end of iter
+  // guarantees no leftover task observes the reset.
+  marl::WaitGroup wg_pAp;
+  marl::WaitGroup wg_rs;
+  marl::WaitGroup wg_iter;
+  marl::Event ev_alpha(marl::Event::Mode::Manual);
+  marl::Event ev_beta(marl::Event::Mode::Manual);
+
+  for (int iter = 0; iter < max_iters; ++iter) {
+    wg_pAp.add(num_tasks);
+    wg_rs.add(num_tasks);
+    wg_iter.add(num_tasks);
+    ev_alpha.clear();
+    ev_beta.clear();
+    double alpha = 0.0;
+    double beta = 0.0;
+
+    for (int i = 0; i < num_tasks; ++i) {
+      marl::schedule([&, i] {
+        defer(wg_iter.done());
+        const int s = i * chunk;
+        const int e = (i == num_tasks - 1) ? n : s + chunk;
+
+        // Phase A: spmv stripe.
+        for (int row = s; row < e; ++row) {
+          double sum = 0.0;
+          for (int j = A.row_ptr[row]; j < A.row_ptr[row + 1]; ++j) {
+            sum += A.values[j] * p[A.col_indices[j]];
+          }
+          ap[row] = sum;
+        }
+
+        // Phase B: partial dot(p, ap).
+        double dpAp = 0.0;
+        for (int j = s; j < e; ++j)
+          dpAp += p[j] * ap[j];
+        partial_pAp[i].v = dpAp;
+        wg_pAp.done();
+
+        ev_alpha.wait();
+
+        // Phase C: x += alpha*p; r -= alpha*ap; partial dot(r, r).
+        double drs = 0.0;
+        for (int j = s; j < e; ++j) {
+          x[j] += alpha * p[j];
+          r[j] -= alpha * ap[j];
+          drs += r[j] * r[j];
+        }
+        partial_rs[i].v = drs;
+        wg_rs.done();
+
+        ev_beta.wait();
+
+        // Phase D: p = r + beta*p. On the converged iteration beta ~= 0
+        // and this write is harmless (the solve is already over).
+        for (int j = s; j < e; ++j)
+          p[j] = r[j] + beta * p[j];
+      });
+    }
+
+    wg_pAp.wait();
+    double pAp = 0.0;
+    for (const auto& pp : partial_pAp)
+      pAp += pp.v;
+    alpha = rs_old / pAp;
+    ev_alpha.signal();
+
+    wg_rs.wait();
+    double rs_new = 0.0;
+    for (const auto& pp : partial_rs)
+      rs_new += pp.v;
+    beta = rs_new / rs_old;
+    ev_beta.signal();
+
+    wg_iter.wait();
+    iters_done = iter + 1;
+    rs_old = rs_new;
+    if (rs_new < tol_sq) {
+      final_residual = std::sqrt(rs_new);
+      break;
+    }
+  }
+
+  printf(" [fused] iters=%d residual=%e\n", iters_done, final_residual);
   return x;
 }
 
@@ -253,14 +403,18 @@ int main(int argc, char** argv) {
 
     std::vector<double> b = {1, 2};
 
-    // Solve the system
+    // Solve with both variants for parity check.
     std::vector<double> x = conjugate_gradient_marl(A, b, 100, 1e-6);
+    std::vector<double> x_fused =
+        conjugate_gradient_marl_fused(A, b, 100, 1e-6);
 
-    // Print the solution
-    std::cout << "Solution x: [ ";
-    for (auto val : x) {
+    std::cout << "Solution x       : [ ";
+    for (auto val : x)
       std::cout << val << " ";
-    }
+    std::cout << "]" << std::endl;
+    std::cout << "Solution x_fused : [ ";
+    for (auto val : x_fused)
+      std::cout << val << " ";
     std::cout << "]" << std::endl;
   }
 
@@ -327,8 +481,23 @@ int main(int argc, char** argv) {
       }
     }
     std::vector<double> b(n, -1.0);
-    // Solve the system
-    std::vector<double> x = conjugate_gradient_marl(A, b, 1000, 1e-6);
+
+    // Run each variant twice; report the second run to skip first-call
+    // scheduler warmup.
+    auto time_solve = [&](const char* label, auto solver) {
+      solver();
+      auto t0 = std::chrono::high_resolution_clock::now();
+      auto x = solver();
+      auto t1 = std::chrono::high_resolution_clock::now();
+      std::chrono::duration<double> dt = t1 - t0;
+      printf(" %-8s wall=%e s\n", label, dt.count());
+      return x;
+    };
+    time_solve(
+        "classic", [&] { return conjugate_gradient_marl(A, b, 1000, 1e-6); });
+    time_solve("fused", [&] {
+      return conjugate_gradient_marl_fused(A, b, 1000, 1e-6);
+    });
   }
 
   return 0;
