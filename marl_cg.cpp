@@ -3,6 +3,7 @@
 /// -L/Users/ulrich/TPL/marl/build/ -lmarl
 ///
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -242,14 +243,25 @@ std::vector<double> conjugate_gradient_marl_fused(
   std::vector<double> x(A.num_cols, 0.0);
   std::vector<double> r = b;
   std::vector<double> p = r;
-  std::vector<double> ap(n);
 
   auto* sch = marl::Scheduler::get();
   int num_tasks = sch->config().workerThread.count;
   num_tasks = std::min<int>(num_tasks, n);
   if (num_tasks <= 0)
     num_tasks = 1;
-  const int chunk = n / num_tasks;
+  const int chunk = (n + num_tasks - 1) / num_tasks;
+
+  // Per-task scratch for the spmv result A*p restricted to the task's stripe.
+  // ap is only read by the same stripe in Phase C, so it does not need to be
+  // a globally-visible vector — keeping it task-local improves cache locality
+  // (the stripe stays in the worker's L1/L2 between Phases A+B and C) and
+  // removes the size-n global allocation.
+  std::vector<std::vector<double>> ap_local(num_tasks);
+  for (int i = 0; i < num_tasks; ++i) {
+    const int s = i * chunk;
+    const int e = std::min(s + chunk, n);
+    ap_local[i].resize(e - s);
+  }
 
   const double tol_sq = tol * tol;
 
@@ -275,7 +287,6 @@ std::vector<double> conjugate_gradient_marl_fused(
   }
 
   int iters_done = 0;
-  double final_residual = std::sqrt(rs_old);
 
   std::vector<PaddedDouble> partial_pAp(num_tasks);
   std::vector<PaddedDouble> partial_rs(num_tasks);
@@ -298,6 +309,7 @@ std::vector<double> conjugate_gradient_marl_fused(
     ev_beta.clear();
     double alpha = 0.0;
     double beta = 0.0;
+    double rs_new = 0.0;
 
     for (int i = 0; i < num_tasks; ++i) {
       marl::schedule([&, i] {
@@ -305,67 +317,296 @@ std::vector<double> conjugate_gradient_marl_fused(
         const int s = i * chunk;
         const int e = (i == num_tasks - 1) ? n : s + chunk;
 
-        // Phase A: spmv stripe.
+        double* ap_s = ap_local[i].data();
+
+        // Phase A+B fused: spmv stripe and partial dot(p, ap) in one pass.
+        // sum (= ap[row]) is in-register at the moment we'd write it, and
+        // p[row] is the current row index, so we accumulate p[row]*sum here
+        // and skip the second read of ap[s..e).
+        double dpAp = 0.0;
         for (int row = s; row < e; ++row) {
           double sum = 0.0;
           for (int j = A.row_ptr[row]; j < A.row_ptr[row + 1]; ++j) {
             sum += A.values[j] * p[A.col_indices[j]];
           }
-          ap[row] = sum;
+          ap_s[row - s] = sum;
+          dpAp += p[row] * sum;
         }
-
-        // Phase B: partial dot(p, ap).
-        double dpAp = 0.0;
-        for (int j = s; j < e; ++j)
-          dpAp += p[j] * ap[j];
         partial_pAp[i].v = dpAp;
-        wg_pAp.done();
+        // Last to finish Phase B reduces, computes alpha, and broadcasts —
+        // skips a CV roundtrip via the main thread.
+        if (wg_pAp.done()) {
+          double pAp = 0.0;
+          for (const auto& pp : partial_pAp)
+            pAp += pp.v;
+          alpha = rs_old / pAp;
+          ev_alpha.signal();
+        }
 
         ev_alpha.wait();
 
         // Phase C: x += alpha*p; r -= alpha*ap; partial dot(r, r).
-        double drs = 0.0;
-        for (int j = s; j < e; ++j) {
-          x[j] += alpha * p[j];
-          r[j] -= alpha * ap[j];
-          drs += r[j] * r[j];
+        // Stripe-local restrict pointers tell the compiler that xs/rs/ps/aps
+        // do not alias, which is necessary for clean SIMD codegen of this
+        // loop. Scoped to the loop body so the restrict guarantee is local.
+        {
+          double* __restrict__ xs = x.data() + s;
+          double* __restrict__ rs = r.data() + s;
+          const double* __restrict__ ps = p.data() + s;
+          const double* __restrict__ aps = ap_s;
+          const int len = e - s;
+          double drs = 0.0;
+          for (int k = 0; k < len; ++k) {
+            xs[k] += alpha * ps[k];
+            rs[k] -= alpha * aps[k];
+            drs += rs[k] * rs[k];
+          }
+          partial_rs[i].v = drs;
         }
-        partial_rs[i].v = drs;
-        wg_rs.done();
+        // Last to finish Phase C reduces, publishes rs_new + beta, broadcasts.
+        if (wg_rs.done()) {
+          double sum = 0.0;
+          for (const auto& pp : partial_rs)
+            sum += pp.v;
+          rs_new = sum;
+          beta = sum / rs_old;
+          ev_beta.signal();
+        }
 
         ev_beta.wait();
 
         // Phase D: p = r + beta*p. On the converged iteration beta ~= 0
         // and this write is harmless (the solve is already over).
-        for (int j = s; j < e; ++j)
-          p[j] = r[j] + beta * p[j];
+        {
+          double* __restrict__ ps = p.data() + s;
+          const double* __restrict__ rs = r.data() + s;
+          const int len = e - s;
+          for (int k = 0; k < len; ++k)
+            ps[k] = rs[k] + beta * ps[k];
+        }
       });
     }
 
-    wg_pAp.wait();
-    double pAp = 0.0;
-    for (const auto& pp : partial_pAp)
-      pAp += pp.v;
-    alpha = rs_old / pAp;
-    ev_alpha.signal();
-
-    wg_rs.wait();
-    double rs_new = 0.0;
-    for (const auto& pp : partial_rs)
-      rs_new += pp.v;
-    beta = rs_new / rs_old;
-    ev_beta.signal();
-
+    // Reductions, alpha, beta, and the event signals all happen on the
+    // last-to-arrive worker now (see if (wg_*.done()) blocks above), so the
+    // main thread no longer participates per phase — it just waits for the
+    // whole iteration to finish and then checks convergence.
     wg_iter.wait();
     iters_done = iter + 1;
     rs_old = rs_new;
-    if (rs_new < tol_sq) {
-      final_residual = std::sqrt(rs_new);
+    if (rs_new < tol_sq)
       break;
-    }
   }
 
+  // Compute final_residual from rs_old after the loop so it reflects the
+  // last iteration's residual whether we converged or hit max_iters.
+  const double final_residual = std::sqrt(rs_old);
   printf(" [fused] iters=%d residual=%e\n", iters_done, final_residual);
+  return x;
+}
+
+// Persistent-workers variant. Same math as the fused version, but each worker
+// is scheduled exactly once and runs the *entire* CG loop internally. Main
+// only sets up per-iteration sync primitives, signals iter start, and waits.
+//
+// Why: in the fused version, marl::schedule is called num_tasks * max_iters
+// times per solve (e.g. 16 * 420 = 6,720 closure constructions and queue
+// pushes). Persistent workers schedule num_tasks tasks once and pay zero
+// per-iter scheduling overhead.
+//
+// Synchronization layout per iteration:
+//   ev_iter[K&1] : main signals → workers wake at top of iter K
+//   wg_pAp/ev_alpha : last-to-arrive in Phase B reduces, broadcasts alpha
+//   wg_rs/ev_beta   : last-to-arrive in Phase C reduces, broadcasts beta+rs_new
+//   wg_iter         : workers signal completion of Phase D → main proceeds
+// ev_iter is a *pair* of events that ping-pong by iteration parity. This
+// avoids a race where a fast worker would race past ev_iter.wait of iter K+1
+// before main has cleared the previous signal: at iter K, main signals and
+// later clears ev_iter[K&1], while workers in iter K+1 wait on ev_iter[(K+1)&1]
+// which has been cleared since the end of iter K-1 (or is in initial cleared
+// state). ev_alpha/ev_beta only need a single event each because main clears
+// them at iter setup before signaling ev_iter, so workers can't race past
+// them across iterations.
+//
+// Convergence/exit: main sets `stop = true` and signals both ev_iter events;
+// workers wake from whichever they're waiting on, observe stop, and return.
+//
+// The structure is preconditioner-ready: r is preserved (not localized) so a
+// future PCG variant can apply z = M^-1 r with stripe-local kernels.
+std::vector<double> conjugate_gradient_marl_persistent(
+    const SparseMatrix& A,
+    const std::vector<double>& b,
+    int max_iters,
+    double tol) {
+  const int n = A.num_rows;
+  std::vector<double> x(A.num_cols, 0.0);
+  std::vector<double> r = b;
+  std::vector<double> p = r;
+
+  auto* sch = marl::Scheduler::get();
+  int num_tasks = sch->config().workerThread.count;
+  num_tasks = std::min<int>(num_tasks, n);
+  if (num_tasks <= 0)
+    num_tasks = 1;
+  const int chunk = (n + num_tasks - 1) / num_tasks;
+  const double tol_sq = tol * tol;
+
+  std::vector<std::vector<double>> ap_local(num_tasks);
+  for (int i = 0; i < num_tasks; ++i) {
+    const int s = i * chunk;
+    const int e = (i == num_tasks - 1) ? n : s + chunk;
+    ap_local[i].resize(e - s);
+  }
+
+  // Prelude: rs_old = dot(r, r). One-shot fork-join, before persistent
+  // workers are scheduled.
+  double rs_old = 0.0;
+  {
+    std::vector<PaddedDouble> partials(num_tasks);
+    marl::WaitGroup wg(num_tasks);
+    for (int i = 0; i < num_tasks; ++i) {
+      marl::schedule([&, i] {
+        defer(wg.done());
+        const int s = i * chunk;
+        const int e = (i == num_tasks - 1) ? n : s + chunk;
+        double sum = 0.0;
+        for (int j = s; j < e; ++j)
+          sum += r[j] * r[j];
+        partials[i].v = sum;
+      });
+    }
+    wg.wait();
+    for (const auto& pp : partials)
+      rs_old += pp.v;
+  }
+
+  std::vector<PaddedDouble> partial_pAp(num_tasks);
+  std::vector<PaddedDouble> partial_rs(num_tasks);
+
+  marl::WaitGroup wg_pAp;
+  marl::WaitGroup wg_rs;
+  marl::WaitGroup wg_iter;
+  marl::WaitGroup wg_workers_done(num_tasks);
+  marl::Event ev_alpha(marl::Event::Mode::Manual);
+  marl::Event ev_beta(marl::Event::Mode::Manual);
+  // Alternating per-iter "go" events. Workers wait on ev_iter[local_iter & 1];
+  // main signals ev_iter[iter & 1] and clears it after wg_iter.wait — at
+  // which point all workers have advanced to the OTHER event in the pair.
+  marl::Event ev_iter0(marl::Event::Mode::Manual);
+  marl::Event ev_iter1(marl::Event::Mode::Manual);
+  auto ev_iter_at = [&](int k) -> marl::Event& {
+    return (k & 1) ? ev_iter1 : ev_iter0;
+  };
+
+  // Per-iter shared scalars. Writes from a single last-to-arrive worker;
+  // reads by main and other workers go through wg/event happens-before.
+  double alpha = 0.0;
+  double beta = 0.0;
+  double rs_new = 0.0;
+  bool stop = false;
+  int iters_done = 0;
+
+  // Schedule one persistent worker per stripe.
+  for (int i = 0; i < num_tasks; ++i) {
+    marl::schedule([&, i] {
+      defer(wg_workers_done.done());
+      const int s = i * chunk;
+      const int e = (i == num_tasks - 1) ? n : s + chunk;
+      double* ap_s = ap_local[i].data();
+      int local_iter = 0;
+      while (true) {
+        ev_iter_at(local_iter).wait();
+        if (stop)
+          return;
+
+        // Phase A+B fused.
+        double dpAp = 0.0;
+        for (int row = s; row < e; ++row) {
+          double sum = 0.0;
+          for (int j = A.row_ptr[row]; j < A.row_ptr[row + 1]; ++j) {
+            sum += A.values[j] * p[A.col_indices[j]];
+          }
+          ap_s[row - s] = sum;
+          dpAp += p[row] * sum;
+        }
+        partial_pAp[i].v = dpAp;
+        if (wg_pAp.done()) {
+          double pAp = 0.0;
+          for (const auto& pp : partial_pAp)
+            pAp += pp.v;
+          alpha = rs_old / pAp;
+          ev_alpha.signal();
+        }
+        ev_alpha.wait();
+
+        // Phase C: x += alpha*p; r -= alpha*ap; partial dot(r, r).
+        {
+          double* __restrict__ xs = x.data() + s;
+          double* __restrict__ rs = r.data() + s;
+          const double* __restrict__ ps = p.data() + s;
+          const double* __restrict__ aps = ap_s;
+          const int len = e - s;
+          double drs = 0.0;
+          for (int k = 0; k < len; ++k) {
+            xs[k] += alpha * ps[k];
+            rs[k] -= alpha * aps[k];
+            drs += rs[k] * rs[k];
+          }
+          partial_rs[i].v = drs;
+        }
+        if (wg_rs.done()) {
+          double sum = 0.0;
+          for (const auto& pp : partial_rs)
+            sum += pp.v;
+          rs_new = sum;
+          beta = sum / rs_old;
+          ev_beta.signal();
+        }
+        ev_beta.wait();
+
+        // Phase D: p = r + beta*p.
+        {
+          double* __restrict__ ps = p.data() + s;
+          const double* __restrict__ rs = r.data() + s;
+          const int len = e - s;
+          for (int k = 0; k < len; ++k)
+            ps[k] = rs[k] + beta * ps[k];
+        }
+
+        wg_iter.done();
+        ++local_iter;
+      }
+    });
+  }
+
+  // Main loop: per iter, set up barriers and wake workers.
+  for (int iter = 0; iter < max_iters; ++iter) {
+    wg_pAp.add(num_tasks);
+    wg_rs.add(num_tasks);
+    wg_iter.add(num_tasks);
+    // Cleared BEFORE ev_iter signal so workers can't race past Phase B
+    // with stale alpha/beta from the previous iter.
+    ev_alpha.clear();
+    ev_beta.clear();
+    ev_iter_at(iter).signal();
+    wg_iter.wait();
+    // Safe to clear: all workers have advanced to wait on the OTHER event.
+    ev_iter_at(iter).clear();
+    iters_done = iter + 1;
+    rs_old = rs_new;
+    if (rs_new < tol_sq)
+      break;
+  }
+
+  // Wake workers and ask them to exit. Signal both events because we don't
+  // know which one workers were about to wait on.
+  stop = true;
+  ev_iter0.signal();
+  ev_iter1.signal();
+  wg_workers_done.wait();
+
+  const double final_residual = std::sqrt(rs_old);
+  printf(" [persistent] iters=%d residual=%e\n", iters_done, final_residual);
   return x;
 }
 
@@ -403,17 +644,23 @@ int main(int argc, char** argv) {
 
     std::vector<double> b = {1, 2};
 
-    // Solve with both variants for parity check.
+    // Solve with all three variants for parity check.
     std::vector<double> x = conjugate_gradient_marl(A, b, 100, 1e-6);
     std::vector<double> x_fused =
         conjugate_gradient_marl_fused(A, b, 100, 1e-6);
+    std::vector<double> x_persistent =
+        conjugate_gradient_marl_persistent(A, b, 100, 1e-6);
 
-    std::cout << "Solution x       : [ ";
+    std::cout << "Solution x            : [ ";
     for (auto val : x)
       std::cout << val << " ";
     std::cout << "]" << std::endl;
-    std::cout << "Solution x_fused : [ ";
+    std::cout << "Solution x_fused      : [ ";
     for (auto val : x_fused)
+      std::cout << val << " ";
+    std::cout << "]" << std::endl;
+    std::cout << "Solution x_persistent : [ ";
+    for (auto val : x_persistent)
       std::cout << val << " ";
     std::cout << "]" << std::endl;
   }
@@ -482,21 +729,41 @@ int main(int argc, char** argv) {
     }
     std::vector<double> b(n, -1.0);
 
-    // Run each variant twice; report the second run to skip first-call
-    // scheduler warmup.
+    // Run one warmup (skip first-call scheduler/cache effects), then `reps`
+    // timed repetitions. Report mean/min/max so single-run noise on a
+    // laptop (thermal, scheduler, core swaps) doesn't dominate.
+    constexpr int reps = 16;
     auto time_solve = [&](const char* label, auto solver) {
-      solver();
-      auto t0 = std::chrono::high_resolution_clock::now();
-      auto x = solver();
-      auto t1 = std::chrono::high_resolution_clock::now();
-      std::chrono::duration<double> dt = t1 - t0;
-      printf(" %-8s wall=%e s\n", label, dt.count());
+      solver(); // warmup
+      std::vector<double> times;
+      times.reserve(reps);
+      std::vector<double> x;
+      for (int r = 0; r < reps; ++r) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        x = solver();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        times.push_back(std::chrono::duration<double>(t1 - t0).count());
+      }
+      const double sum = std::accumulate(times.begin(), times.end(), 0.0);
+      const double mean = sum / reps;
+      const double tmin = *std::min_element(times.begin(), times.end());
+      const double tmax = *std::max_element(times.begin(), times.end());
+      printf(
+          " %-8s reps=%d  mean=%e s  min=%e s  max=%e s\n",
+          label,
+          reps,
+          mean,
+          tmin,
+          tmax);
       return x;
     };
     time_solve(
         "classic", [&] { return conjugate_gradient_marl(A, b, 1000, 1e-6); });
     time_solve("fused", [&] {
       return conjugate_gradient_marl_fused(A, b, 1000, 1e-6);
+    });
+    time_solve("persist", [&] {
+      return conjugate_gradient_marl_persistent(A, b, 1000, 1e-6);
     });
   }
 
