@@ -153,12 +153,20 @@ void spmv(
       defer(wg.done());
       int start_row = i * chunk_size;
       int end_row = (i == num_tasks - 1) ? A.num_rows : start_row + chunk_size;
+      // Hoisted/restricted base pointers and inner-loop bound. Assumes y
+      // and x do not alias (true for all CG-internal calls).
+      double* __restrict__ y_data = y.data();
+      const double* __restrict__ x_data = x.data();
+      const double* __restrict__ A_values = A.values.data();
+      const int* __restrict__ A_col = A.col_indices.data();
+      const int* __restrict__ A_rp = A.row_ptr.data();
       for (int row = start_row; row < end_row; ++row) {
+        const int j_end = A_rp[row + 1];
         double sum = 0.0;
-        for (int j = A.row_ptr[row]; j < A.row_ptr[row + 1]; ++j) {
-          sum += A.values[j] * x[A.col_indices[j]];
+        for (int j = A_rp[row]; j < j_end; ++j) {
+          sum += A_values[j] * x_data[A_col[j]];
         }
-        y[row] = sum;
+        y_data[row] = sum;
       }
     });
   }
@@ -187,8 +195,13 @@ std::vector<double> conjugate_gradient_marl(
 
   double rs_old = dot(r, r, &stats);
 
+  // Early exit if b already satisfies tolerance — avoids 0/0 in alpha = rs/pAp.
+  if (rs_old < tol_sq) {
+    printf(" iters=0 residual=%e\n", std::sqrt(rs_old));
+    return x;
+  }
+
   int iters_done = 0;
-  double final_residual = std::sqrt(rs_old);
   for (int i = 0; i < max_iters; ++i) {
     spmv(ap, A, p, &stats);
     double alpha = rs_old / dot(p, ap, &stats);
@@ -198,15 +211,19 @@ std::vector<double> conjugate_gradient_marl(
 
     double rs_new = dot(r, r, &stats);
     iters_done = i + 1;
-    if (rs_new < tol_sq) {
-      final_residual = std::sqrt(rs_new);
-      break;
-    }
-
-    axpy(p, r, p, rs_new / rs_old, &stats);
+    // Compute beta with the OLD rs_old, then update rs_old so the post-loop
+    // sqrt sees the latest residual (whether we converge or hit max_iters).
+    const double beta = rs_new / rs_old;
     rs_old = rs_new;
+    if (rs_new < tol_sq)
+      break;
+
+    axpy(p, r, p, beta, &stats);
   }
 
+  // Compute residual from rs_old after the loop so it reflects the last
+  // iteration's residual whether we converged or hit max_iters.
+  const double final_residual = std::sqrt(rs_old);
   printf(" iters=%d residual=%e\n", iters_done, final_residual);
   printf(
       " dot:  calls=%d total=%e avg=%e\n",
@@ -296,6 +313,14 @@ std::vector<double> conjugate_gradient_marl_fused(
 
   int iters_done = 0;
 
+  // Early exit if b (and hence the initial residual) already satisfies the
+  // tolerance. Avoids a 0/0 in alpha = rs_old / pAp on a trivially-solved
+  // problem.
+  if (rs_old < tol_sq) {
+    printf(" [fused] iters=0 residual=%e\n", std::sqrt(rs_old));
+    return x;
+  }
+
   // Hoisted out of the loop: each marl::WaitGroup / marl::Event ctor does a
   // heap allocation (shared_ptr to a Data/Shared block holding mutex + CV).
   // Reused via add()/clear() each iteration; wg_iter.wait() at end of iter
@@ -322,33 +347,41 @@ std::vector<double> conjugate_gradient_marl_fused(
         const int s = i * chunk;
         const int e = (i == num_tasks - 1) ? n : s + chunk;
 
-        double* ap_s = ap_local[i].data();
+        double* __restrict__ ap_s = ap_local[i].data();
 
         // Phase A+B fused: spmv stripe and partial dot(p, ap) in one pass.
         // sum (= ap[row]) is in-register at the moment we'd write it, and
         // p[row] is the current row index, so we accumulate p[row]*sum here
-        // and skip the second read of ap[s..e).
+        // and skip the second read of ap[s..e). Hoisted/restricted base
+        // pointers give the compiler the same alias-freedom we use in the
+        // other phases.
+        const double* __restrict__ A_values = A.values.data();
+        const int* __restrict__ A_col = A.col_indices.data();
+        const int* __restrict__ A_rp = A.row_ptr.data();
+        const double* __restrict__ p_data = p.data();
         double dpAp = 0.0;
         for (int row = s; row < e; ++row) {
+          const int j_end = A_rp[row + 1];
           double sum = 0.0;
-          for (int j = A.row_ptr[row]; j < A.row_ptr[row + 1]; ++j) {
-            sum += A.values[j] * p[A.col_indices[j]];
+          for (int j = A_rp[row]; j < j_end; ++j) {
+            sum += A_values[j] * p_data[A_col[j]];
           }
           ap_s[row - s] = sum;
-          dpAp += p[row] * sum;
+          dpAp += p_data[row] * sum;
         }
         partial_pAp[i].v = dpAp;
-        // Last to finish Phase B reduces, computes alpha, and broadcasts —
-        // skips a CV roundtrip via the main thread.
+        // Last to finish Phase B reduces, computes alpha, and broadcasts;
+        // it has nothing to wait for and skips the wait. Other workers wait
+        // on the broadcast.
         if (wg_pAp.done()) {
           double pAp = 0.0;
           for (const auto& pp : partial_pAp)
             pAp += pp.v;
           alpha = rs_old / pAp;
           ev_alpha.signal();
+        } else {
+          ev_alpha.wait();
         }
-
-        ev_alpha.wait();
 
         // Phase C: x += alpha*p; r -= alpha*ap; partial dot(r, r).
         // Stripe-local restrict pointers tell the compiler that xs/rs/ps/aps
@@ -369,6 +402,7 @@ std::vector<double> conjugate_gradient_marl_fused(
           partial_rs[i].v = drs;
         }
         // Last to finish Phase C reduces, publishes rs_new + beta, broadcasts.
+        // Same wait-skip pattern as Phase B.
         if (wg_rs.done()) {
           double sum = 0.0;
           for (const auto& pp : partial_rs)
@@ -376,9 +410,9 @@ std::vector<double> conjugate_gradient_marl_fused(
           rs_new = sum;
           beta = sum / rs_old;
           ev_beta.signal();
+        } else {
+          ev_beta.wait();
         }
-
-        ev_beta.wait();
 
         // Phase D: p = r + beta*p. On the converged iteration beta ~= 0
         // and this write is harmless (the solve is already over).
@@ -485,6 +519,13 @@ std::vector<double> conjugate_gradient_marl_persistent(
       rs_old += pp.v;
   }
 
+  // Early exit if b already satisfies tolerance. Done before scheduling the
+  // persistent workers so we don't pay even their setup cost.
+  if (rs_old < tol_sq) {
+    printf(" [persistent] iters=0 residual=%e\n", std::sqrt(rs_old));
+    return x;
+  }
+
   std::vector<PaddedDouble> partial_pAp(num_tasks);
   std::vector<PaddedDouble> partial_rs(num_tasks);
 
@@ -517,32 +558,42 @@ std::vector<double> conjugate_gradient_marl_persistent(
       defer(wg_workers_done.done());
       const int s = i * chunk;
       const int e = (i == num_tasks - 1) ? n : s + chunk;
-      double* ap_s = ap_local[i].data();
+      double* __restrict__ ap_s = ap_local[i].data();
+      // Hoisted matrix/vector base pointers; same alias-freedom story as in
+      // the fused variant's Phase A+B.
+      const double* __restrict__ A_values = A.values.data();
+      const int* __restrict__ A_col = A.col_indices.data();
+      const int* __restrict__ A_rp = A.row_ptr.data();
+      const double* __restrict__ p_data = p.data();
       int local_iter = 0;
       while (true) {
         ev_iter_at(local_iter).wait();
         if (stop)
           return;
 
-        // Phase A+B fused.
+        // Phase A+B fused: spmv stripe and partial dot(p, ap) in one pass.
         double dpAp = 0.0;
         for (int row = s; row < e; ++row) {
+          const int j_end = A_rp[row + 1];
           double sum = 0.0;
-          for (int j = A.row_ptr[row]; j < A.row_ptr[row + 1]; ++j) {
-            sum += A.values[j] * p[A.col_indices[j]];
+          for (int j = A_rp[row]; j < j_end; ++j) {
+            sum += A_values[j] * p_data[A_col[j]];
           }
           ap_s[row - s] = sum;
-          dpAp += p[row] * sum;
+          dpAp += p_data[row] * sum;
         }
         partial_pAp[i].v = dpAp;
+        // Last-to-arrive reduces, computes alpha, signals — and skips the
+        // wait since it's the one that just signaled.
         if (wg_pAp.done()) {
           double pAp = 0.0;
           for (const auto& pp : partial_pAp)
             pAp += pp.v;
           alpha = rs_old / pAp;
           ev_alpha.signal();
+        } else {
+          ev_alpha.wait();
         }
-        ev_alpha.wait();
 
         // Phase C: x += alpha*p; r -= alpha*ap; partial dot(r, r).
         {
@@ -559,6 +610,8 @@ std::vector<double> conjugate_gradient_marl_persistent(
           }
           partial_rs[i].v = drs;
         }
+        // Same wait-skip pattern: last-to-arrive reduces and signals; others
+        // wait on the broadcast.
         if (wg_rs.done()) {
           double sum = 0.0;
           for (const auto& pp : partial_rs)
@@ -566,8 +619,9 @@ std::vector<double> conjugate_gradient_marl_persistent(
           rs_new = sum;
           beta = sum / rs_old;
           ev_beta.signal();
+        } else {
+          ev_beta.wait();
         }
-        ev_beta.wait();
 
         // Phase D: p = r + beta*p.
         {
