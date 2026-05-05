@@ -34,6 +34,12 @@ struct alignas(64) PaddedDouble {
   double v;
 };
 
+// Multiplier on the per-solve task count. num_tasks defaults to the marl
+// worker thread count; setting g_tasks_per_worker > 1 over-decomposes so
+// each OS thread runs multiple stripe-fibers per iteration. Set from main()
+// before each timing sweep.
+int g_tasks_per_worker = 1;
+
 // Aggregated per-kernel timing, printed once at end of solve.
 struct KernelStats {
   double dot_seconds = 0.0;
@@ -53,7 +59,7 @@ double dot(
     KernelStats* stats = nullptr) {
   auto start = std::chrono::high_resolution_clock::now();
   auto* sch = marl::Scheduler::get();
-  int num_tasks = sch->config().workerThread.count;
+  int num_tasks = sch->config().workerThread.count * g_tasks_per_worker;
   num_tasks = std::min<int>(num_tasks, static_cast<int>(a.size()));
   if (num_tasks <= 0)
     num_tasks = 1;
@@ -100,7 +106,7 @@ void axpy(
     KernelStats* stats = nullptr) {
   auto start = std::chrono::high_resolution_clock::now();
   auto* sch = marl::Scheduler::get();
-  int num_tasks = sch->config().workerThread.count;
+  int num_tasks = sch->config().workerThread.count * g_tasks_per_worker;
   num_tasks = std::min<int>(num_tasks, static_cast<int>(v_out.size()));
   if (num_tasks <= 0)
     num_tasks = 1;
@@ -135,7 +141,7 @@ void spmv(
     KernelStats* stats = nullptr) {
   auto start = std::chrono::high_resolution_clock::now();
   auto* sch = marl::Scheduler::get();
-  int num_tasks = sch->config().workerThread.count;
+  int num_tasks = sch->config().workerThread.count * g_tasks_per_worker;
   num_tasks = std::min<int>(num_tasks, A.num_rows);
   if (num_tasks <= 0)
     num_tasks = 1;
@@ -245,7 +251,7 @@ std::vector<double> conjugate_gradient_marl_fused(
   std::vector<double> p = r;
 
   auto* sch = marl::Scheduler::get();
-  int num_tasks = sch->config().workerThread.count;
+  int num_tasks = sch->config().workerThread.count * g_tasks_per_worker;
   num_tasks = std::min<int>(num_tasks, n);
   if (num_tasks <= 0)
     num_tasks = 1;
@@ -265,10 +271,12 @@ std::vector<double> conjugate_gradient_marl_fused(
 
   const double tol_sq = tol * tol;
 
+  std::vector<PaddedDouble> partial_pAp(num_tasks);
+  std::vector<PaddedDouble> partial_rs(num_tasks);
+
   // Initial rs_old = dot(r, r) — single fork-join, before the fused loop.
   double rs_old = 0.0;
   {
-    std::vector<PaddedDouble> partials(num_tasks);
     marl::WaitGroup wg(num_tasks);
     for (int i = 0; i < num_tasks; ++i) {
       marl::schedule([&, i] {
@@ -278,18 +286,15 @@ std::vector<double> conjugate_gradient_marl_fused(
         double sum = 0.0;
         for (int j = s; j < e; ++j)
           sum += r[j] * r[j];
-        partials[i].v = sum;
+        partial_rs[i].v = sum;
       });
     }
     wg.wait();
-    for (const auto& pp : partials)
+    for (const auto& pp : partial_rs)
       rs_old += pp.v;
   }
 
   int iters_done = 0;
-
-  std::vector<PaddedDouble> partial_pAp(num_tasks);
-  std::vector<PaddedDouble> partial_rs(num_tasks);
 
   // Hoisted out of the loop: each marl::WaitGroup / marl::Event ctor does a
   // heap allocation (shared_ptr to a Data/Shared block holding mutex + CV).
@@ -444,7 +449,7 @@ std::vector<double> conjugate_gradient_marl_persistent(
   std::vector<double> p = r;
 
   auto* sch = marl::Scheduler::get();
-  int num_tasks = sch->config().workerThread.count;
+  int num_tasks = sch->config().workerThread.count * g_tasks_per_worker;
   num_tasks = std::min<int>(num_tasks, n);
   if (num_tasks <= 0)
     num_tasks = 1;
@@ -749,22 +754,29 @@ int main(int argc, char** argv) {
       const double tmin = *std::min_element(times.begin(), times.end());
       const double tmax = *std::max_element(times.begin(), times.end());
       printf(
-          " %-8s reps=%d  mean=%e s  min=%e s  max=%e s\n",
+          " %-8s tpw=%d reps=%d  mean=%e s  min=%e s  max=%e s\n",
           label,
+          g_tasks_per_worker,
           reps,
           mean,
           tmin,
           tmax);
       return x;
     };
-    time_solve(
-        "classic", [&] { return conjugate_gradient_marl(A, b, 1000, 1e-6); });
-    time_solve("fused", [&] {
-      return conjugate_gradient_marl_fused(A, b, 1000, 1e-6);
-    });
-    time_solve("persist", [&] {
-      return conjugate_gradient_marl_persistent(A, b, 1000, 1e-6);
-    });
+    // Sweep tasks_per_worker to study the effect of over-decomposition.
+    // tpw=1: one stripe per worker (current default).
+    // tpw>1: each worker holds multiple stripe-fibers; stripes are smaller.
+    for (int tpw : {1, 2}) {
+      g_tasks_per_worker = tpw;
+      time_solve(
+          "classic", [&] { return conjugate_gradient_marl(A, b, 1000, 1e-6); });
+      time_solve("fused", [&] {
+        return conjugate_gradient_marl_fused(A, b, 1000, 1e-6);
+      });
+      time_solve("persist", [&] {
+        return conjugate_gradient_marl_persistent(A, b, 1000, 1e-6);
+      });
+    }
   }
 
   return 0;
